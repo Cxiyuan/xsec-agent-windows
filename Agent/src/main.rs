@@ -286,7 +286,123 @@ pub fn format_rate(bytes_per_sec: u64) -> String {
 // 主程序
 // ============================================================================
 
+
+// ============================================================================
+// Daemon 模式
+// ============================================================================
+
+fn run_daemon_mode() {
+    println!("[xsec-agent] 启动 Daemon 模式...");
+    
+    // 读取配置
+    let config_path = "/etc/xsec-agent/config.toml";
+    let config_content = std::fs::read_to_string(config_path).unwrap_or_default();
+    
+    // 简单的配置解析
+    let manager_host = extract_config_value(&config_content, "host").unwrap_or("127.0.0.1".to_string());
+    let manager_port: u16 = extract_config_value(&config_content, "port")
+        .unwrap_or("8443".to_string())
+        .parse()
+        .unwrap_or(8443);
+    let secret_key = extract_config_value(&config_content, "secret_key").unwrap_or("qaz@7410".to_string());
+    let agent_id = extract_config_value(&config_content, "id")
+        .unwrap_or_else(|| hostname::get().map(|s| s.to_string_lossy().to_string()).unwrap_or_default());
+    
+    println!("[xsec-agent] Manager: {}:{}", manager_host, manager_port);
+    
+    let config = ManagerConfig {
+        host: manager_host,
+        port: manager_port,
+        agent_id: agent_id.clone(),
+        secret_key,
+        heartbeat_interval_secs: 30,
+        reconnect_delay_secs: 5,
+        connection_timeout_secs: 10,
+    };
+    
+    let client = Client::new(config);
+    
+    // 连接 Manager
+    loop {
+        println!("[xsec-agent] 尝试连接 Manager...");
+        match client.connect() {
+            Ok(_) => {
+                println!("[xsec-agent] 已连接到 Manager");
+                break;
+            }
+            Err(e) => {
+                println!("[xsec-agent] 连接失败: {:?}, 5秒后重试...", e);
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
+        }
+    }
+    
+    // 主循环 - 发送心跳
+    loop {
+        let mut monitor = SystemMonitor::new();
+        monitor.collect();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let metrics = monitor.collect();
+        
+        let heartbeat_data = HeartbeatData {
+            status: "online".to_string(),
+            cpu_percent: metrics.cpu.usage_percent,
+            memory_percent: metrics.memory.usage_percent,
+            disk_percent: metrics.disk.first().map(|d| d.usage_percent).unwrap_or(0.0),
+            network_in: metrics.network.total_rx_bytes_per_sec,
+            network_out: metrics.network.total_tx_bytes_per_sec,
+            active_threats: 0,
+            pending_commands: 0,
+        };
+        
+        let heartbeat = create_heartbeat_message(&agent_id, heartbeat_data);
+        
+        if let Err(e) = client.send_message(&heartbeat) {
+            println!("[xsec-agent] 发送心跳失败: {:?}, 重新连接...", e);
+            loop {
+                match client.connect() {
+                    Ok(_) => {
+                        println!("[xsec-agent] 重新连接成功");
+                        break;
+                    }
+                    Err(e) => {
+                        println!("[xsec-agent] 重连失败: {:?}, 5秒后重试...", e);
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                    }
+                }
+            }
+        }
+        
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+}
+
+fn extract_config_value(content: &str, key: &str) -> Option<String> {
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with(&format!("{}=", key)) {
+            let value = line.split('=').nth(1)?.trim();
+            // 去掉引号
+            let value = value.trim_matches('"').trim_matches('\'');
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+// ============================================================================
+// 主程序入口
+// ============================================================================
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    
+    // 检查 daemon 模式
+    if args.contains(&"--daemon".to_string()) || args.contains(&"-d".to_string()) {
+        run_daemon_mode();
+        return;
+    }
+    
     println!("══════════════════════════════════════════");
     println!("  XSEC Agent - 系统监控工具");
     println!("  支持平台: Linux / Windows");
@@ -309,6 +425,8 @@ fn main() {
     println!("  0. 退出");
     println!();
     println!("当前平台: {}", cfg!(target_os = "linux").then(|| "Linux").unwrap_or("Windows"));
+    println!();
+    println!("提示: 使用 --daemon 参数可后台运行连接 Manager");
     println!();
 
     loop {
