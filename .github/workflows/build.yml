@@ -1,0 +1,83 @@
+name: Build Windows Agent
+
+on:
+  push:
+    branches: [ main ]
+  release:
+    types: [ created ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Add MSVC target
+        run: rustup target add x86_64-pc-windows-msvc
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./ -> target
+
+      - name: Build release
+        run: |
+          cd Agent
+          cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Build installer script
+        shell: pwsh
+        run: |
+          $binPath = "Agent/target/x86_64-pc-windows-msvc/release/xsec-agent.exe"
+          $base64 = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($binPath))
+          $installer = @"
+          # xsec-agent Windows Installer
+          `$ErrorActionPreference = "Stop"
+          
+          Write-Host "正在安装 xsec-agent..."
+          
+          `$tempFile = "`$env:TEMP\\xsec-agent.exe"
+          `$bytes = [Convert]::FromBase64String("$base64")
+          [System.IO.File]::WriteAllBytes(`$tempFile, `$bytes)
+          
+          # Stop existing service if running
+          Get-Service -Name xsec-agent -ErrorAction SilentlyContinue | Stop-Service -Force -ErrorAction SilentlyContinue
+          
+          # Install service
+          & `$tempFile install --service
+          
+          # Start service
+          Start-Service -Name xsec-agent -ErrorAction SilentlyContinue
+          
+          # Cleanup
+          Remove-Item `$tempFile -Force -ErrorAction SilentlyContinue
+          
+          Write-Host "安装完成!"
+          "@
+          $installer | Out-File -FilePath "xsec-agent-windows-installer.ps1" -Encoding UTF8
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xsec-agent-windows
+          path: |
+            Agent/target/x86_64-pc-windows-msvc/release/xsec-agent.exe
+            xsec-agent-windows-installer.ps1
+          retention-days: 30
+
+      - name: Create Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            Agent/target/x86_64-pc-windows-msvc/release/xsec-agent.exe
+            xsec-agent-windows-installer.ps1
+          asset_name: xsec-agent-windows
