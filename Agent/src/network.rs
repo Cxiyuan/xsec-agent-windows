@@ -560,7 +560,7 @@ impl NetworkMonitor {
                     remote_addr: remote_addr.clone(),
                     remote_port,
                     state: state.clone(),
-                    direction,
+                    direction: direction.clone(),
                 });
 
                 entry.total_connections += 1;
