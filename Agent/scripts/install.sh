@@ -180,21 +180,30 @@ backup_config() {
 
 # 安装二进制文件
 install_binary() {
-    log_info "安装二进制文件..."
+    log_info "提取二进制文件..."
     
-    local BIN_PATH=""
-    if [[ -f "./target/release/xsec-agent" ]]; then
-        BIN_PATH="./target/release/xsec-agent"
-    elif [[ -f "./target/debug/xsec-agent" ]]; then
-        BIN_PATH="./target/debug/xsec-agent"
-    elif [[ -f "./xsec-agent" ]]; then
-        BIN_PATH="./xsec-agent"
-    else
-        log_error "未找到 xsec-agent 二进制文件，请先编译"
+    local SCRIPT_PATH="$(readlink -f "$0")"
+    local EXTRACTED_BIN="/tmp/xsec-agent-bin-$$"
+    
+    # 找到 ---BINARY END--- 标记
+    local MARKER_LINE=$(grep -n "^---BINARY END---$" "$SCRIPT_PATH" | cut -d: -f1 | tail -1)
+    if [[ -z "$MARKER_LINE" ]]; then
+        log_error "未找到二进制标记，请确认使用的是正确的安装脚本"
         exit 1
     fi
     
-    install -m 755 "${BIN_PATH}" "${BIN_DIR}/${AGENT_NAME}"
+    # 提取并解码
+    tail -n +$((MARKER_LINE + 1)) "$SCRIPT_PATH" | base64 -d > "$EXTRACTED_BIN"
+    
+    if [[ ! -f "$EXTRACTED_BIN" ]] || [[ ! -s "$EXTRACTED_BIN" ]]; then
+        log_error "二进制文件提取失败"
+        rm -f "$EXTRACTED_BIN"
+        exit 1
+    fi
+    
+    log_info "安装二进制文件..."
+    install -m 755 "${EXTRACTED_BIN}" "${BIN_DIR}/${AGENT_NAME}"
+    rm -f "$EXTRACTED_BIN"
     log_info "二进制文件已安装到 ${BIN_DIR}/${AGENT_NAME}"
 }
 
