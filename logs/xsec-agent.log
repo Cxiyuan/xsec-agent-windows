@@ -1,0 +1,78 @@
+2026-04-06T01:48:02.151470Z  INFO xsec_agent::logging: xsec-agent logging initialized
+2026-04-06T01:48:02.152871Z  INFO xsec_agent::logging: log_dir: "logs"
+2026-04-06T01:48:02.152927Z  INFO xsec_agent::logging: level: info
+2026-04-06T01:48:18.733400Z  INFO xsec_agent::logging: xsec-agent logging initialized
+2026-04-06T01:48:18.733493Z  INFO xsec_agent::logging: log_dir: "logs"
+2026-04-06T01:48:18.733545Z  INFO xsec_agent::logging: level: info
+2026-04-06T01:48:18.734602Z  INFO xsec_agent::logging: xsec-agent logging initialized
+2026-04-06T01:48:18.734706Z  INFO xsec_agent::logging: log_dir: "logs"
+2026-04-06T01:48:18.734758Z  INFO xsec_agent::logging: level: info
+2026-04-06T01:50:05.371641Z  INFO xsec_agent::logging: xsec-agent logging initialized
+2026-04-06T01:50:05.371797Z  INFO xsec_agent::logging: log_dir: "logs"
+2026-04-06T01:50:05.371871Z  INFO xsec_agent::logging: level: info
+2026-04-06T01:50:05.372572Z  INFO xsec_agent::logging: xsec-agent logging initialized
+2026-04-06T01:50:05.372695Z  INFO xsec_agent::logging: log_dir: "logs"
+2026-04-06T01:50:05.372776Z  INFO xsec_agent::logging: level: info
+2026-04-06T01:50:05.372831Z  INFO xsec_agent::logging: xsec-agent logging initialized
+2026-04-06T01:50:05.372990Z  INFO xsec_agent::logging: log_dir: "logs"
+2026-04-06T01:50:05.373075Z  INFO xsec_agent::logging: level: info
+2026-04-06T01:51:48.133580Z  INFO xsec_agent::logging: xsec-agent logging initialized
+2026-04-06T01:51:48.133639Z  INFO xsec_agent::logging: xsec-agent logging initialized
+2026-04-06T01:51:48.133673Z  INFO xsec_agent::logging: log_dir: "logs"
+2026-04-06T01:51:48.133727Z  INFO xsec_agent::logging: level: info
+2026-04-06T01:51:48.133754Z  INFO xsec_agent::logging: log_dir: "logs"
+2026-04-06T01:51:48.133827Z  INFO xsec_agent::logging: level: info
+2026-04-06T01:51:48.133951Z  INFO xsec_agent::logging: xsec-agent logging initialized
+2026-04-06T01:51:48.134066Z  INFO xsec_agent::logging: log_dir: "logs"
+2026-04-06T01:51:48.134163Z  INFO xsec_agent::logging: level: info
+2026-04-06T01:53:01.332829Z  INFO xsec_agent::logging: xsec-agent logging initialized
+2026-04-06T01:53:01.332939Z  INFO xsec_agent::logging: log_dir: "logs"
+2026-04-06T01:53:01.333003Z  INFO xsec_agent::logging: level: info
+2026-04-06T01:53:20.932423Z  INFO xsec_agent::logging: xsec-agent logging initialized
+2026-04-06T01:53:20.932532Z  INFO xsec_agent::logging: log_dir: "logs"
+2026-04-06T01:53:20.932596Z  INFO xsec_agent::logging: level: info
+2026-04-06T01:55:45.877417Z  INFO xsec_agent::logging: xsec-agent logging initialized
+2026-04-06T01:55:45.877546Z  INFO xsec_agent::logging: log_dir: "logs"
+2026-04-06T01:55:45.877626Z  INFO xsec_agent::logging: level: info
+2026-04-06T01:55:45.879992Z  INFO xsec_agent::logging: xsec-agent logging initialized
+2026-04-06T01:55:45.880076Z  INFO xsec_agent::logging: log_dir: "logs"
+2026-04-06T01:55:45.880124Z  INFO xsec_agent::logging: level: info
+2026-04-06T01:55:45.880106Z  INFO xsec_agent::logging: xsec-agent logging initialized
+2026-04-06T01:55:45.880227Z  INFO xsec_agent::logging: log_dir: "logs"
+2026-04-06T01:55:45.880306Z  INFO xsec_agent::logging: level: info
+2026-04-06T01:56:32.928877Z  INFO xsec_agent::logging: xsec-agent logging initialized
+2026-04-06T01:56:32.928966Z  INFO xsec_agent::logging: log_dir: "logs"
+2026-04-06T01:56:32.929018Z  INFO xsec_agent::logging: level: info
+2026-04-06T01:56:32.929069Z  INFO xsec_agent::logging: xsec-agent logging initialized
+2026-04-06T01:56:32.929185Z  INFO xsec_agent::logging: log_dir: "logs"
+2026-04-06T01:56:32.929260Z  INFO xsec_agent::logging: level: info
+2026-04-06T01:56:32.929834Z  INFO xsec_agent::logging: xsec-agent logging initialized
+2026-04-06T01:56:32.929954Z  INFO xsec_agent::logging: log_dir: "logs"
+2026-04-06T01:56:32.930089Z  INFO xsec_agent::logging: level: info
+2026-04-06T01:57:06.290208Z  INFO xsec_agent::logging: xsec-agent logging initialized
+2026-04-06T01:57:06.290330Z  INFO xsec_agent::logging: log_dir: "logs"
+2026-04-06T01:57:06.290406Z  INFO xsec_agent::logging: level: info
+2026-04-06T01:57:06.290410Z  INFO xsec_agent::logging: xsec-agent logging initialized
+2026-04-06T01:57:06.290556Z  INFO xsec_agent::logging: log_dir: "logs"
+2026-04-06T01:57:06.290622Z  INFO xsec_agent::logging: level: info
+2026-04-06T01:57:06.291985Z  INFO xsec_agent::logging: xsec-agent logging initialized
+2026-04-06T01:57:06.292096Z  INFO xsec_agent::logging: log_dir: "logs"
+2026-04-06T01:57:06.292162Z  INFO xsec_agent::logging: level: info
+2026-04-06T01:58:12.279924Z  INFO xsec_agent::logging: xsec-agent logging initialized
+2026-04-06T01:58:12.280013Z  INFO xsec_agent::logging: log_dir: "logs"
+2026-04-06T01:58:12.280069Z  INFO xsec_agent::logging: level: info
+2026-04-06T01:58:12.280148Z  INFO xsec_agent::logging: xsec-agent logging initialized
+2026-04-06T01:58:12.280244Z  INFO xsec_agent::logging: xsec-agent logging initialized
+2026-04-06T01:58:12.280266Z  INFO xsec_agent::logging: log_dir: "logs"
+2026-04-06T01:58:12.280349Z  INFO xsec_agent::logging: level: info
+2026-04-06T01:58:12.280357Z  INFO xsec_agent::logging: log_dir: "logs"
+2026-04-06T01:58:12.280440Z  INFO xsec_agent::logging: level: info
+2026-04-06T01:58:53.789285Z  INFO xsec_agent::logging: xsec-agent logging initialized
+2026-04-06T01:58:53.789411Z  INFO xsec_agent::logging: log_dir: "logs"
+2026-04-06T01:58:53.789492Z  INFO xsec_agent::logging: level: info
+2026-04-06T01:58:53.789808Z  INFO xsec_agent::logging: xsec-agent logging initialized
+2026-04-06T01:58:53.789954Z  INFO xsec_agent::logging: log_dir: "logs"
+2026-04-06T01:58:53.790065Z  INFO xsec_agent::logging: level: info
+2026-04-06T01:58:53.792191Z  INFO xsec_agent::logging: xsec-agent logging initialized
+2026-04-06T01:58:53.792278Z  INFO xsec_agent::logging: log_dir: "logs"
+2026-04-06T01:58:53.792328Z  INFO xsec_agent::logging: level: info

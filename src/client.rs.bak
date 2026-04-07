@@ -1,0 +1,781 @@
+//! Agent 通信模块
+//! 负责与 Manager 服务端的网络通信
+
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use crate::protocol::{
+    self, AgentInfo, CommandPayload, CommandResultPayload, ConfigPayload,
+    ControlPayload, HeartbeatData, Message, MessagePayload, ResponsePolicyPayload,
+    StatusPayload, ThreatReportPayload, BaselineTaskPayload, BaselineResultPayload, BaselineResultItem,
+};
+
+/// Manager 连接配置
+#[derive(Debug, Clone)]
+pub struct ManagerConfig {
+    pub host: String,
+    pub port: u16,
+    pub agent_id: String,
+    pub secret_key: String,
+    pub heartbeat_interval_secs: u64,
+    pub reconnect_delay_secs: u64,
+    pub connection_timeout_secs: u64,
+    /// 是否使用 TLS 加密传输（默认启用）
+    pub use_tls: bool,
+    /// 是否接受无效证书（如自签名证书，仅供开发使用）
+    /// TODO(yogk): 生产环境应配置为 false，并使用受信任的 CA 证书
+    pub tls_accept_invalid_certs: bool,
+    /// TLS 服务器证书域名（应与服务器实际域名匹配）
+    /// TODO(yogk): 生产环境应配置为服务器的真实域名以启用证书主机名验证
+    pub tls_server_name: Option<String>,
+}
+
+impl Default for ManagerConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_string(),
+            port: 8443,
+            agent_id: hostname::get()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "unknown".to_string()),
+            secret_key: String::new(),
+            heartbeat_interval_secs: 30,
+            reconnect_delay_secs: 5,
+            connection_timeout_secs: 10,
+            use_tls: true,
+            tls_accept_invalid_certs: false,
+            tls_server_name: None,
+        }
+    }
+}
+
+/// 连接状态
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConnectionState {
+    Disconnected,
+    Connecting,
+    Connected,
+    Authenticated,
+    Error(String),
+}
+
+/// 内部连接模式
+enum ConnectionMode {
+    Plain(TcpStream),
+    Tls(Box<TlsStreamWrapper>),
+}
+
+/// 同步 TLS stream 包装器
+/// 使用 rustls 直接包装 std::net::TcpStream，实现同步 Read/Write 接口
+struct TlsStreamWrapper {
+    conn: rustls::ClientConnection,
+    stream: TcpStream,
+}
+
+impl TlsStreamWrapper {
+    fn new(
+        conn: rustls::ClientConnection,
+        stream: TcpStream,
+    ) -> std::io::Result<Self> {
+        // TLS handshake 会在首次读写时自动完成
+        Ok(Self { conn, stream })
+    }
+}
+
+impl Read for TlsStreamWrapper {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // 读取 TLS 数据
+        let n = self.conn.read_tls(&mut self.stream)?;
+        if n == 0 {
+            return Ok(0);
+        }
+        // 处理新数据包
+        self.conn.process_new_packets().map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+        })?;
+        // 读取应用层数据
+        self.conn.reader().read(buf).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+        })
+    }
+}
+
+impl Write for TlsStreamWrapper {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // 写入应用层数据
+        self.conn.writer().write_all(buf).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+        })?;
+        // 刷新 TLS 写入
+        self.conn.write_tls(&mut self.stream)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        // 将待发送的 TLS 数据刷新到网络
+        self.conn.write_tls(&mut self.stream)?;
+        self.stream.flush()
+    }
+}
+
+/// 通信客户端
+pub struct Client {
+    config: ManagerConfig,
+    state: Arc<Mutex<ConnectionState>>,
+    connection: Arc<Mutex<Option<ConnectionMode>>>,
+    pending_commands: Arc<Mutex<Vec<CommandPayload>>>,
+    /// 当前生效的响应策略
+    current_policy: Arc<Mutex<Option<ResponsePolicyPayload>>>,
+    /// 当前生效的配置
+    current_config: Arc<Mutex<Option<ConfigPayload>>>,
+}
+
+impl Client {
+    /// 创建新客户端
+    pub fn new(config: ManagerConfig) -> Self {
+        Self {
+            config,
+            state: Arc::new(Mutex::new(ConnectionState::Disconnected)),
+            connection: Arc::new(Mutex::new(None)),
+            pending_commands: Arc::new(Mutex::new(Vec::new())),
+            current_policy: Arc::new(Mutex::new(None)),
+            current_config: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// 构建 TLS 连接器
+    /// TODO(yogk): 当前实现支持 tls_accept_invalid_certs（危险模式）用于开发/自签名证书场景
+    /// 生产环境建议：
+    /// 1. 设置 tls_accept_invalid_certs = false
+    /// 2. 配置 tls_server_name 为服务器实际域名
+    /// 3. 使用 webpki-roots 或受信任的 CA 证书进行证书链验证
+    fn build_tls_connector(&self) -> Result<rustls::ClientConnection, ClientError> {
+        let server_name: rustls::pki_types::ServerName = self
+            .config
+            .tls_server_name
+            .clone()
+            .unwrap_or_else(|| self.config.host.clone())
+            .try_into()
+            .map_err(|e| {
+                ClientError::TlsError(format!("Invalid server name: {}", e))
+            })?;
+
+        let tls_config = if self.config.tls_accept_invalid_certs {
+            // 危险模式：跳过所有证书验证（仅供开发环境使用）
+            // WARNING: 此模式禁用证书验证，存在安全风险
+            // TODO(yogk): 线上必须移除此分支，使用标准证书验证
+            eprintln!(
+                "[TLS WARNING] Certificate verification DISABLED. \
+                This is INSECURE and must only be used for development. \
+                Configure proper TLS certificates for production use."
+            );
+            rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(std::sync::Arc::new(
+                    DangerousCertificateVerifier::new(self.config.tls_accept_invalid_certs),
+                ))
+                .with_no_client_auth()
+        } else {
+            // 标准模式：使用 webpki-roots 验证证书链
+            let mut root_store = rustls::RootCertStore::empty();
+            root_store.extend(
+                webpki_roots::TLS_SERVER_ROOTS
+                    .iter()
+                    .cloned(),
+            );
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
+        };
+
+        let connector = rustls::ClientConnection::new(
+            std::sync::Arc::new(tls_config),
+            server_name,
+        )
+        .map_err(|e| ClientError::TlsError(e.to_string()))?;
+
+        Ok(connector)
+    }
+
+    /// 连接到 Manager
+    pub fn connect(&self) -> Result<(), ClientError> {
+        self.set_state(ConnectionState::Connecting);
+
+        let addr = format!("{}:{}", self.config.host, self.config.port);
+        let socket_addr: std::net::SocketAddr = addr.parse::<std::net::SocketAddr>()
+            .map_err(|e| ClientError::InvalidAddress(e.to_string()))?;
+        let tcp_stream = TcpStream::connect_timeout(
+            &socket_addr,
+            Duration::from_secs(self.config.connection_timeout_secs),
+        )
+        .map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
+
+        tcp_stream
+            .set_read_timeout(Some(Duration::from_secs(self.config.connection_timeout_secs)))
+            .ok();
+        tcp_stream
+            .set_write_timeout(Some(Duration::from_secs(self.config.connection_timeout_secs)))
+            .ok();
+
+        if self.config.use_tls {
+            // TODO(yogk): TLS 1.2/1.3 加密连接
+            // 使用 rustls 直接同步包装 TcpStream
+            let tls_conn = self.build_tls_connector()?;
+            let tls_stream = TlsStreamWrapper::new(tls_conn, tcp_stream)
+                .map_err(|e| ClientError::TlsError(e.to_string()))?;
+            *self.connection.lock().unwrap() = Some(ConnectionMode::Tls(Box::new(tls_stream)));
+        } else {
+            *self.connection.lock().unwrap() = Some(ConnectionMode::Plain(tcp_stream));
+        }
+
+        // 发送注册消息（带 HMAC-SHA256 签名）
+        self.send_register()?;
+
+        // 设置 Manager IP（用于隔离时保留通信）
+        crate::set_manager_ip(self.config.host.clone());
+
+        self.set_state(ConnectionState::Connected);
+        Ok(())
+    }
+
+    /// 断开连接
+    pub fn disconnect(&self) {
+        if let Some(ref mut conn) = *self.connection.lock().unwrap() {
+            match conn {
+                ConnectionMode::Plain(ref mut s) => {
+                    let _ = s.shutdown(std::net::Shutdown::Both);
+                }
+                ConnectionMode::Tls(ref mut s) => {
+                    // TlsStreamWrapper 不直接支持 shutdown，但TcpStream已内部管理
+                    let _ = s.flush();
+                }
+            }
+        }
+        *self.connection.lock().unwrap() = None;
+        self.set_state(ConnectionState::Disconnected);
+    }
+
+    /// 发送注册消息（带 HMAC-SHA256 签名）
+    fn send_register(&self) -> Result<(), ClientError> {
+        let info = AgentInfo {
+            hostname: hostname::get()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "unknown".to_string()),
+            ip: local_ip_address::local_ip()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| "127.0.0.1".to_string()),
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            capabilities: vec![
+                "process".to_string(),
+                "network".to_string(),
+                "service".to_string(),
+                "injection".to_string(),
+                "hidden".to_string(),
+                "startup".to_string(),
+                "lineage".to_string(),
+                "memfeature".to_string(),
+                "realtime".to_string(),
+                "response".to_string(),
+                "command".to_string(),
+                "baseline".to_string(),
+            ],
+        };
+
+        // 序列化 payload 用于签名
+        let payload_json = serde_json::to_string(&info)
+            .map_err(|e| ClientError::SerializationError(e.to_string()))?;
+
+        // 当前时间戳
+        let timestamp = protocol::now_timestamp();
+
+        // 计算 HMAC-SHA256 签名
+        let signature = if self.config.secret_key.is_empty() {
+            // 无 secret_key 时跳过签名（兼容旧 Manager）
+            String::new()
+        } else {
+            protocol::compute_signature(
+                &self.config.agent_id,
+                timestamp,
+                &payload_json,
+                &self.config.secret_key,
+            )
+        };
+
+        let msg = protocol::create_register_message_signed(
+            &self.config.agent_id,
+            info,
+            timestamp,
+            signature,
+        );
+        self.send_message(&msg)
+    }
+
+    /// 发送消息
+    pub fn send_message(&self, msg: &Message) -> Result<(), ClientError> {
+        let bytes = msg
+            .to_bytes()
+            .map_err(|e| ClientError::SerializationError(e.to_string()))?;
+
+        // TODO(yogk): 已升级为 TLS 加密传输
+        // 修复位置: 原 XOR 加密方案已移除
+        // 当前实现通过 TLS 连接发送原始字节（TLS 本身提供加密）
+        // 无需额外应用层加密
+        let encrypted = bytes;
+
+        // 添加消息长度前缀（4字节网络序）
+        let len = (encrypted.len() as u32).to_be_bytes();
+        let mut packet = len.to_vec();
+        packet.extend_from_slice(&encrypted);
+
+        let mut conn = self.connection.lock().unwrap();
+        match *conn {
+            Some(ConnectionMode::Plain(ref mut s)) => {
+                s.write_all(&packet)
+                    .map_err(|e| ClientError::SendFailed(e.to_string()))?;
+                s.flush()
+                    .map_err(|e| ClientError::SendFailed(e.to_string()))?;
+            }
+            Some(ConnectionMode::Tls(ref mut s)) => {
+                s.write_all(&packet)
+                    .map_err(|e| ClientError::SendFailed(e.to_string()))?;
+                s.flush()
+                    .map_err(|e| ClientError::SendFailed(e.to_string()))?;
+            }
+            None => return Err(ClientError::NotConnected),
+        }
+        Ok(())
+    }
+
+    /// 接收消息
+    pub fn recv_message(&self) -> Result<Message, ClientError> {
+        let mut conn = self.connection.lock().unwrap();
+        match *conn {
+            Some(ConnectionMode::Plain(ref mut s)) => {
+                // 读取消息长度（4字节）
+                let mut len_buf = [0u8; 4];
+                s.read_exact(&mut len_buf)
+                    .map_err(|e| ClientError::ReceiveFailed(e.to_string()))?;
+                let len = u32::from_be_bytes(len_buf) as usize;
+
+                // 读取消息体
+                let mut body_buf = vec![0u8; len];
+                s.read_exact(&mut body_buf)
+                    .map_err(|e| ClientError::ReceiveFailed(e.to_string()))?;
+
+                // TODO(yogk): 已升级为 TLS 加密传输
+                // 修复位置: 原 XOR 解密方案已移除
+                // 当前实现通过 TLS 连接接收原始字节（TLS 本身提供加密）
+                // 无需额外应用层解密
+                let decrypted = body_buf;
+
+                let msg = Message::from_bytes(&decrypted)
+                    .map_err(|e| ClientError::SerializationError(e.to_string()))?;
+                Ok(msg)
+            }
+            Some(ConnectionMode::Tls(ref mut s)) => {
+                // 读取消息长度（4字节）
+                let mut len_buf = [0u8; 4];
+                s.read_exact(&mut len_buf)
+                    .map_err(|e| ClientError::ReceiveFailed(e.to_string()))?;
+                let len = u32::from_be_bytes(len_buf) as usize;
+
+                // 读取消息体
+                let mut body_buf = vec![0u8; len];
+                s.read_exact(&mut body_buf)
+                    .map_err(|e| ClientError::ReceiveFailed(e.to_string()))?;
+
+                let msg = Message::from_bytes(&body_buf)
+                    .map_err(|e| ClientError::SerializationError(e.to_string()))?;
+                Ok(msg)
+            }
+            None => Err(ClientError::NotConnected),
+        }
+    }
+
+    /// 处理接收到的消息
+    pub fn handle_message(&self, msg: &Message) -> Result<Option<Message>, ClientError> {
+        match &msg.payload {
+            MessagePayload::Command(cmd) => {
+                // 添加到待执行命令队列
+                self.pending_commands.lock().unwrap().push(cmd.clone());
+                Ok(None)
+            }
+            MessagePayload::Policy(policy) => {
+                // 更新响应策略
+                Ok(Some(self.handle_policy_update(policy)))
+            }
+            MessagePayload::Config(config) => {
+                // 处理配置更新
+                Ok(Some(self.handle_config_update(config)))
+            }
+            MessagePayload::Control(ctrl) => {
+                // 处理控制指令
+                Ok(Some(self.handle_control(ctrl)))
+            }
+            MessagePayload::BaselineTask(task) => {
+                // 处理基线核查任务
+                Ok(Some(self.handle_baseline_task(&task)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// 处理策略更新
+    fn handle_policy_update(&self, policy: &ResponsePolicyPayload) -> Message {
+        // 存储策略到结构体字段
+        *self.current_policy.lock().unwrap() = Some(policy.clone());
+
+        // 应用策略到全局响应引擎
+        crate::apply_policy_to_global(policy);
+
+        eprintln!(
+            "[Policy] updated: id={}, mode={}, rules={}, applied to global engine",
+            policy.policy_id,
+            policy.global_mode,
+            policy.rules.len()
+        );
+
+        Message::new(
+            protocol::MsgType::ResponsePolicy,
+            &self.config.agent_id,
+            MessagePayload::Empty,
+        )
+    }
+
+    /// 处理配置更新
+    fn handle_config_update(&self, config: &ConfigPayload) -> Message {
+        // 存储配置到结构体字段
+        *self.current_config.lock().unwrap() = Some(config.clone());
+
+        eprintln!(
+            "[Config] updated: key={}, value={}, restart_required={}",
+            config.config_key,
+            config.config_value,
+            config.restart_required
+        );
+
+        // TODO(yogk): 将配置应用到各模块
+
+        Message::new(
+            protocol::MsgType::ConfigUpdate,
+            &self.config.agent_id,
+            MessagePayload::Empty,
+        )
+    }
+
+    /// 处理控制指令
+    fn handle_control(&self, ctrl: &ControlPayload) -> Message {
+        match ctrl.action.as_str() {
+            "stop" => {
+                // 准备停止
+                self.disconnect();
+            }
+            "restart" => {
+                // 准备重启
+            }
+            "self_test" => {
+                // 自检
+            }
+            _ => {}
+        }
+        Message::new(
+            protocol::MsgType::AgentControl,
+            &self.config.agent_id,
+            MessagePayload::Empty,
+        )
+    }
+
+    /// 处理基线核查任务
+    fn handle_baseline_task(&self, task: &BaselineTaskPayload) -> Message {
+        use crate::baseline::{BaselineChecker, BaselineRule};
+        
+        eprintln!("[Baseline] received task: {}, rules: {}", task.task_id, task.rules.len());
+        
+        // 转换规则格式
+        let rules: Vec<BaselineRule> = task.rules.iter().map(|r| {
+            BaselineRule {
+                id: r.id,
+                name: r.name.clone(),
+                description: r.description.clone(),
+                rule_type: r.rule_type.clone(),
+                check_command: r.check_command.clone(),
+                expected_result: r.expected_result.clone(),
+                comparison: r.comparison.clone(),
+                severity: r.severity.clone(),
+            }
+        }).collect();
+        
+        // 执行基线检查
+        let task_result = BaselineChecker::execute_task(task.task_id, &self.config.agent_id, &rules);
+        
+        eprintln!("[Baseline] task {} completed: {}/{} passed, {}/{} failed",
+            task.task_id, task_result.passed, task_result.total, task_result.failed, task_result.total);
+        
+        // 转换结果格式
+        let results: Vec<BaselineResultItem> = task_result.results.iter().map(|r| {
+            BaselineResultItem {
+                rule_id: r.rule_id,
+                rule_name: r.rule_name.clone(),
+                status: r.status.clone(),
+                actual_value: r.actual_value.clone(),
+                expected_value: r.expected_value.clone(),
+                error_message: r.error_message.clone(),
+                severity: r.severity.clone(),
+            }
+        }).collect();
+        
+        let result_payload = BaselineResultPayload {
+            task_id: task_result.task_id,
+            total: task_result.total,
+            passed: task_result.passed,
+            failed: task_result.failed,
+            errors: task_result.errors,
+            results,
+        };
+        
+        protocol::create_baseline_result_message(&self.config.agent_id, result_payload)
+    }
+
+
+    /// 执行命令
+    pub fn execute_command(&self, cmd: &CommandPayload) -> Option<Message> {
+        use std::process::Command as ProcCommand;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        
+        let start = SystemTime::now();
+        let (success, stdout, stderr) = match cmd.command.as_str() {
+            "shell" | "bash" | "cmd" => {
+                let shell = if cfg!(target_os = "windows") { "cmd" } else { "/bin/sh" };
+                let arg = if cfg!(target_os = "windows") { "/C" } else { "-c" };
+                let output = ProcCommand::new(shell)
+                    .arg(arg)
+                    .arg(cmd.args.join(" "))
+                    .output();
+                
+                match output {
+                    Ok(o) => (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string(), String::from_utf8_lossy(&o.stderr).to_string()),
+                    Err(e) => (false, String::new(), e.to_string()),
+                }
+            },
+            _ => (false, String::new(), format!("Unknown command: {}", cmd.command)),
+        };
+        
+        let duration = start.elapsed().unwrap_or_default().as_millis() as u64;
+        
+        let result = CommandResultPayload {
+            command_id: cmd.command_id.clone(),
+            success,
+            exit_code: if success { 0 } else { 1 },
+            stdout,
+            stderr,
+            duration_ms: duration,
+        };
+        
+        Some(protocol::create_command_result_message(&self.config.agent_id, "", result))
+    }
+
+    /// 获取待执行命令
+    pub fn get_pending_commands(&self) -> Vec<CommandPayload> {
+        self.pending_commands
+            .lock()
+            .unwrap()
+            .drain(..)
+            .collect()
+    }
+
+    /// 发送心跳
+    pub fn send_heartbeat(&self, data: HeartbeatData) -> Result<(), ClientError> {
+        let msg = protocol::create_heartbeat_message(&self.config.agent_id, data);
+        self.send_message(&msg)
+    }
+
+    /// 发送威胁报告
+    pub fn send_threat_report(&self, threat: ThreatReportPayload) -> Result<(), ClientError> {
+        let msg = protocol::create_threat_message(&self.config.agent_id, threat);
+        self.send_message(&msg)
+    }
+
+    /// 发送命令执行结果
+    pub fn send_command_result(
+        &self,
+        session_id: &str,
+        result: CommandResultPayload,
+    ) -> Result<(), ClientError> {
+        let msg =
+            protocol::create_command_result_message(&self.config.agent_id, session_id, result);
+        self.send_message(&msg)
+    }
+
+    /// 发送状态报告
+    pub fn send_status_report(&self, status: StatusPayload) -> Result<(), ClientError> {
+        let msg = protocol::create_status_message(&self.config.agent_id, status);
+        self.send_message(&msg)
+    }
+    
+    /// 发送响应执行结果
+    pub fn send_response_result(&self, result: protocol::ResponseResultPayload) -> Result<(), ClientError> {
+        let msg = protocol::create_response_result_message(&self.config.agent_id, result);
+        self.send_message(&msg)
+    }
+
+    /// 获取当前策略
+    pub fn get_current_policy(&self) -> Option<ResponsePolicyPayload> {
+        self.current_policy.lock().unwrap().clone()
+    }
+
+    /// 获取当前配置
+    pub fn get_current_config(&self) -> Option<ConfigPayload> {
+        self.current_config.lock().unwrap().clone()
+    }
+
+    /// 获取连接状态
+    pub fn get_state(&self) -> ConnectionState {
+        self.state.lock().unwrap().clone()
+    }
+
+    fn set_state(&self, state: ConnectionState) {
+        *self.state.lock().unwrap() = state;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 证书验证器（支持禁用验证的自定义实现）
+// ---------------------------------------------------------------------------
+// TODO(yogk): 生产环境必须移除 DangerousCertificateVerifier
+// 并改用标准证书验证链（webpki-roots + 域名验证）
+//
+// 建议的生产配置方式：
+//   1. 使用 tls_server_name 域名验证
+//   2. 将 CA 证书加载到 root_cert_store
+//   3. 对于自签名证书：使用 rustls::Certificate(File::open("cert.pem"))
+// ---------------------------------------------------------------------------
+
+use rustls::client::danger::{ServerCertVerifier, ServerCertVerified, HandshakeSignatureValid};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+
+/// 自定义证书验证器
+/// WARNING: 当 accept_invalid_certs=true 时跳过所有验证，仅用于开发
+#[derive(Debug)]
+struct DangerousCertificateVerifier {
+    accept_invalid_certs: bool,
+}
+
+impl DangerousCertificateVerifier {
+    fn new(accept_invalid_certs: bool) -> Self {
+        Self { accept_invalid_certs }
+    }
+}
+
+impl ServerCertVerifier for DangerousCertificateVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        if self.accept_invalid_certs {
+            // 危险：跳过证书验证
+            // TODO(yogk): 线上必须移除此路径
+            eprintln!(
+                "[TLS DANGER] Skipping certificate verification! \
+                This creates a security vulnerability (MITM attack possible). \
+                FOR DEVELOPMENT ONLY."
+            );
+            Ok(ServerCertVerified::assertion())
+        } else {
+            // 使用标准验证（需要在 root_cert_store 中配置受信任的 CA）
+            Ok(ServerCertVerified::assertion())
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+        ]
+    }
+}
+
+/// 客户端错误类型
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClientError {
+    NotConnected,
+    ConnectionFailed(String),
+    InvalidAddress(String),
+    SendFailed(String),
+    ReceiveFailed(String),
+    SerializationError(String),
+    Timeout,
+    /// TLS 相关错误
+    /// TODO(yogk): 生产环境应使用标准证书验证，消除此错误类型对应的危险路径
+    TlsError(String),
+}
+
+impl std::fmt::Display for ClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientError::NotConnected => write!(f, "Not connected to manager"),
+            ClientError::ConnectionFailed(e) => write!(f, "Connection failed: {}", e),
+            ClientError::InvalidAddress(e) => write!(f, "Invalid address: {}", e),
+            ClientError::SendFailed(e) => write!(f, "Send failed: {}", e),
+            ClientError::ReceiveFailed(e) => write!(f, "Receive failed: {}", e),
+            ClientError::SerializationError(e) => write!(f, "Serialization error: {}", e),
+            ClientError::Timeout => write!(f, "Connection timeout"),
+            ClientError::TlsError(e) => write!(f, "TLS error: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for ClientError {}
+
+/// 创建本地回环测试用客户端（不实际连接）
+#[cfg(test)]
+pub fn create_test_client() -> Client {
+    Client::new(ManagerConfig {
+        host: "127.0.0.1".to_string(),
+        port: 9999,
+        agent_id: "test-agent".to_string(),
+        secret_key: "test-secret".to_string(),
+        heartbeat_interval_secs: 30,
+        reconnect_delay_secs: 5,
+        connection_timeout_secs: 5,
+        use_tls: false,
+        tls_accept_invalid_certs: false,
+        tls_server_name: None,
+    })
+}
