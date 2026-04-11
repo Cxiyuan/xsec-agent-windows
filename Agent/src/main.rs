@@ -199,23 +199,27 @@ impl SystemMonitor {
             });
         }
 
-        // 更新上一次的数据
+        // 更新上一次的数据 (在计算速率之后)
         let prev_rx = self.prev_network_rx;
         let prev_tx = self.prev_network_tx;
+        let prev_ts = self.prev_timestamp;
+
+        // 计算总速率 (使用旧值)
+        let total_rx_per_sec = if timestamp > prev_ts {
+            total_rx.saturating_sub(prev_rx) / (timestamp - prev_ts).max(1)
+        } else {
+            0
+        };
+        let total_tx_per_sec = if timestamp > prev_ts {
+            total_tx.saturating_sub(prev_tx) / (timestamp - prev_ts).max(1)
+        } else {
+            0
+        };
+
+        // 更新状态
         self.prev_network_rx = total_rx;
         self.prev_network_tx = total_tx;
         self.prev_timestamp = timestamp;
-
-        let total_rx_per_sec = if timestamp > self.prev_timestamp {
-            total_rx.saturating_sub(prev_rx) / (timestamp - self.prev_timestamp).max(1)
-        } else {
-            0
-        };
-        let total_tx_per_sec = if timestamp > self.prev_timestamp {
-            total_tx.saturating_sub(prev_tx) / (timestamp - self.prev_timestamp).max(1)
-        } else {
-            0
-        };
 
         SystemMetrics {
             timestamp,

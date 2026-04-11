@@ -441,7 +441,7 @@ impl StartupMonitor {
         }
 
         // 检查可疑路径
-        let suspicious_path_keywords = ["/tmp/", "/var/tmp/", "/dev/shm/", "/ Downloads/", ".ssh/"];
+        let suspicious_path_keywords = ["/tmp/", "/var/tmp/", "/dev/shm/", "/Downloads/", ".ssh/"];
         for keyword in suspicious_path_keywords {
             if path_lower.contains(keyword) {
                 return RiskLevel::Medium;

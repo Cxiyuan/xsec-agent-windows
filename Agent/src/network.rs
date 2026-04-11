@@ -335,7 +335,7 @@ impl NetworkMonitor {
                     };
 
                     entry.connections.push(Connection {
-                        protocol: proto.clone(),
+                        protocol: proto,
                         local_addr: local_parts.0,
                         local_port: listening_port,
                         remote_addr: remote_parts.0,
@@ -388,7 +388,7 @@ impl NetworkMonitor {
                     });
 
                     entry.connections.push(Connection {
-                        protocol: proto.clone(),
+                        protocol: proto,
                         local_addr: local_parts.0,
                         local_port,
                         remote_addr: remote_parts.0,
@@ -560,7 +560,7 @@ impl NetworkMonitor {
                     remote_addr: remote_addr.clone(),
                     remote_port,
                     state: state.clone(),
-                    direction: direction.clone(),
+                    direction,
                 });
 
                 entry.total_connections += 1;

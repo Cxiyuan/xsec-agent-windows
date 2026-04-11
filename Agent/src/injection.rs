@@ -446,7 +446,7 @@ impl InjectionDetector {
                         return Some(InjectionResult {
                             pid,
                             name: name.to_string(),
-                            injection_type: InjectionType::RemoteThread,
+                            injection_type: InjectionType::ThreadInjection,
                             evidence: format!("检测到可疑线程起始地址: {}", susp),
                             severity: InjectionSeverity::High,
                         });

@@ -106,6 +106,14 @@ pub struct AlertManager {
 
 impl AlertManager {
     pub fn new() -> Self {
+        // 平台特定的默认日志路径
+        #[cfg(target_os = "linux")]
+        let default_log = "/var/log/xsec-agent/alerts.log";
+        #[cfg(target_os = "windows")]
+        let default_log = "C:\\ProgramData\\xsec-agent\\logs\\alerts.log";
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        let default_log = "/var/log/xsec-agent/alerts.log";
+
         Self {
             config: AlertConfig {
                 enabled: true,
@@ -113,7 +121,7 @@ impl AlertManager {
                 webhook_url: None,
                 syslog_server: None,
                 syslog_port: 514,
-                log_file: Some("/var/log/xsec-agent/alerts.log".to_string()),
+                log_file: Some(default_log.to_string()),
                 silence_period: 300, // 5分钟沉默期
                 rate_limit: 100,     // 每分钟最多100条
             },
