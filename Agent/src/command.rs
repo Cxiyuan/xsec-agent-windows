@@ -86,22 +86,43 @@ impl CommandWhitelist {
     pub fn is_allowed(&self, command: &str, args: &[String]) -> (bool, String) {
         // 检查命令是否在白名单
         if let Some(allowed_args) = self.allowed_commands.get(command) {
-            // 检查参数是否匹配
-            for pattern in allowed_args {
-                if pattern == "*" || pattern == ".*" {
-                    return (true, "allowed".to_string());
-                }
-                // 简单前缀匹配
-                if args.iter().any(|a| a.starts_with(&pattern.replace("*", ""))) {
-                    return (true, "allowed".to_string());
-                }
-            }
-            // 如果没有匹配任何模式但命令在白名单中，允许执行
-            if args.is_empty() || args.iter().all(|a| a == "-*" || a.starts_with("-")) {
+            // 如果白名单包含 "*" 或 ".*"，表示允许任意参数（仅限安全的只读命令）
+            if allowed_args.iter().any(|p| p == "*" || p == ".*") {
                 return (true, "allowed".to_string());
             }
+
+            // 否则，必须精确匹配参数模式
+            // 所有传入的参数都必须被白名单接受
+            for arg in args {
+                let mut matched = false;
+                for pattern in allowed_args {
+                    let pattern_str = pattern.as_str();
+                    // 检查是否匹配（支持 * 通配符）
+                    if pattern_str == "*" {
+                        matched = true;
+                        break;
+                    } else if pattern.ends_with("*") && pattern_str.len() > 1 {
+                        // 前缀匹配，如 "status*" 匹配 "status", "statusall"
+                        let prefix = &pattern_str[..pattern_str.len() - 1];
+                        if arg.starts_with(prefix) {
+                            matched = true;
+                            break;
+                        }
+                    } else if arg == pattern_str {
+                        // 精确匹配
+                        matched = true;
+                        break;
+                    }
+                }
+                if !matched {
+                    return (false, format!("argument '{}' not allowed for command '{}'", arg, command));
+                }
+            }
+
+            // 所有参数都已验证通过
+            return (true, "allowed".to_string());
         }
-        
+
         (false, format!("command '{}' not in whitelist", command))
     }
 }

@@ -472,11 +472,12 @@ impl StartupMonitor {
         let mut items = Vec::new();
         
         // Registry paths for startup
+        // Note: reg query requires full HKEY names, not abbreviations
         let registry_paths = [
-            (r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run", "HKLM"),
-            (r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run", "HKCU"),
-            (r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce", "HKLM"),
-            (r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce", "HKCU"),
+            (r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run", "HKLM"),
+            (r"HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\Run", "HKCU"),
+            (r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce", "HKLM"),
+            (r"HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce", "HKCU"),
         ];
 
         for (reg_path, hive) in &registry_paths {
@@ -525,22 +526,25 @@ impl StartupMonitor {
         if let Ok(output) = output {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines().skip(1) {
-                // CSV parsing
+                // CSV parsing - with bounds checking to prevent panics
                 let fields: Vec<&str> = line.split(',').collect();
-                if fields.len() > 5 {
-                    let task_name = fields[1].trim_matches('"');
-                    let status = fields[3].trim_matches('"');
-                    let run_type = fields[5].trim_matches('"');
+                if fields.len() < 6 {
+                    continue; // Skip malformed lines
+                }
+                let task_name = fields.get(1).map(|s| s.trim_matches('"')).unwrap_or("");
+                let status = fields.get(3).map(|s| s.trim_matches('"')).unwrap_or("");
+                let run_type = fields.get(5).map(|s| s.trim_matches('"')).unwrap_or("");
                     
                     if status != "Disabled" {
                         let risk = self.assess_risk(task_name, run_type, StartupType::ScheduledTask);
-                        
+                        let user = fields.get(2).map(|s| s.trim_matches('"')).unwrap_or("");
+
                         items.push(StartupItem {
                             name: task_name.to_string(),
                             path: run_type.to_string(),
                             item_type: StartupType::ScheduledTask,
                             enabled: status == "Ready",
-                            user: fields[2].trim_matches('"').to_string(),
+                            user: user.to_string(),
                             source: "schtasks".to_string(),
                             risk_level: risk,
                         });

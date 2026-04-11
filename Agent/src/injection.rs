@@ -410,16 +410,52 @@ impl InjectionDetector {
 
     #[cfg(target_os = "windows")]
     fn check_remote_thread(&self, pid: u32, name: &str) -> Option<InjectionResult> {
-        // 使用 tasklist 检查
-        let output = Command::new("wmic")
-            .args(["process", "where", &format!("ProcessId={}", pid), "get", "ParentProcessId"])
+        // 检测远程线程创建：检查是否有来自其他进程的线程被注入到当前进程
+        // 使用 PowerShell 的 Get-Process 和 Get-Thread 命令
+        let output = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "Get-Process -Id {} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Threads | Select-Object -Property Id, StartAddress, ThreadState, WaitReason",
+                    pid
+                ),
+            ])
             .output();
 
         if let Ok(output) = output {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            // 如果父进程是系统进程但不是正常的 svchost, csrss 等
-            // 这可能是注入的结果
+
+            // 检查线程的起始地址是否在可疑范围内
+            // 0x0-0x10000 通常表示未分配或可疑
+            for line in stdout.lines() {
+                if line.contains("Id") || line.trim().is_empty() {
+                    continue;
+                }
+
+                // 如果能解析出起始地址，检查是否可疑
+                // 注意：这是一个简化检测，真正的实现需要使用 Windows API
+                let suspicious_starts = [
+                    "0x00000000",    // 空指针
+                    "0x00010000",    // 用户模式空间低端
+                    "0x7ffe0000",    // Win32k 区域（可能被利用）
+                ];
+
+                for susp in &suspicious_starts {
+                    if line.contains(susp) {
+                        return Some(InjectionResult {
+                            pid,
+                            name: name.to_string(),
+                            injection_type: InjectionType::RemoteThread,
+                            evidence: format!("检测到可疑线程起始地址: {}", susp),
+                            severity: InjectionSeverity::High,
+                        });
+                    }
+                }
+            }
         }
+
+        // 如果检测失败，返回 None（不阻止其他检测继续）
         None
     }
 

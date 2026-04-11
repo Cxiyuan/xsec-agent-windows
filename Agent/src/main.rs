@@ -293,18 +293,31 @@ pub fn format_rate(bytes_per_sec: u64) -> String {
 
 fn run_daemon_mode() {
     println!("[xsec-agent] 启动 Daemon 模式...");
-    
-    // 读取配置
+
+    // 读取配置 - 使用平台特定的配置路径
+    #[cfg(target_os = "windows")]
+    let config_path = "C:\\ProgramData\\xsec-agent\\config.toml";
+    #[cfg(target_os = "linux")]
     let config_path = "/etc/xsec-agent/config.toml";
-    let config_content = std::fs::read_to_string(config_path).unwrap_or_default();
-    
+
+    let config_content = match std::fs::read_to_string(config_path) {
+        Ok(content) => content,
+        Err(e) => {
+            eprintln!("[ERROR] Failed to read config from {}: {}", config_path, e);
+            eprintln!("[ERROR] Agent requires a valid config.toml to run. Exiting.");
+            std::process::exit(1);
+        }
+    };
+
     // 简单的配置解析
     let manager_host = extract_config_value(&config_content, "host").unwrap_or("127.0.0.1".to_string());
     let manager_port: u16 = extract_config_value(&config_content, "port")
         .unwrap_or("8443".to_string())
         .parse()
         .unwrap_or(8443);
-    let secret_key = extract_config_value(&config_content, "secret_key").unwrap_or("qaz@7410".to_string());
+    let secret_key = extract_config_value(&config_content, "secret_key").expect(
+        "secret_key must be configured in config.toml - hardcoded secrets are not allowed"
+    );
     let agent_id = extract_config_value(&config_content, "id")
         .unwrap_or_else(|| hostname::get().map(|s| s.to_string_lossy().to_string()).unwrap_or_default());
     
