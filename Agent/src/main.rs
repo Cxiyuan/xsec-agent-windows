@@ -13,13 +13,16 @@ mod command;
 mod response;
 mod protocol;
 mod client;
+mod ws_client;
 mod securitylog;
 mod fim;
 mod webmalware;
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use std::sync::Arc;
 use sysinfo::{Disks, Networks, System};
+use tokio::sync::mpsc;
 
 pub use process::{format_process_list, get_process_list, ProcessInfo, ProcessList};
 pub use service::{format_service_list, get_service_list, ServiceInfo, ServiceList};
@@ -34,8 +37,9 @@ pub use memfeature::{format_memory_features, MemoryFeatureDetector, ProcessMemor
 pub use realtime::{RealtimeMonitor, MonitorConfig, MonitorStats, format_monitor_stats, format_monitor_config};
 pub use command::{CommandExecutor, CommandRequest, CommandResult, CommandWhitelist, format_command_result};
 pub use response::{ResponseEngine, ResponseRule, ResponseAction, ResponseResult, ResponseLevel, format_response_results, format_response_rules};
-pub use protocol::{Message, MsgType, AgentInfo, HeartbeatData, ThreatReportPayload, CommandPayload, CommandResultPayload, ResponsePolicyPayload, create_register_message, create_heartbeat_message, create_threat_message, create_command_result_message, create_status_message};
+pub use protocol::{Message, MsgType, AgentInfo, HeartbeatData, ThreatReportPayload, CommandPayload, CommandResultPayload, ResponsePolicyPayload, EnvironmentInfo, DiskInfo, PortInfo, create_register_message, create_register_message_simple, create_heartbeat_message, create_threat_message, create_command_result_message, create_status_message};
 pub use client::{Client, ManagerConfig, ConnectionState, ClientError};
+pub use ws_client::{WssClient, WsConfig, WsConnectionState, WsMessage, FileChunk, WsMessageType};
 pub use securitylog::{LogCollector, LogEntry, LogLevel, SecurityEvent, SecurityEventType, format_security_events, format_log_entries};
 pub use fim::{FimMonitor, FimReport, MonitoredItem, FileSnapshot, FileChangeEvent, RiskLevel, format_fim_report, format_change_events};
 pub use webmalware::{WebMalwareScanner, MaliciousFileResult, MaliciousFileType, MalwareThreatLevel, ScanConfig, format_scan_results, format_single_result};
@@ -245,6 +249,159 @@ impl Default for SystemMonitor {
     }
 }
 
+impl SystemMonitor {
+    /// 采集详细环境信息
+    pub fn collect_environment(&mut self) -> EnvironmentInfo {
+        // CPU 信息
+        let cpus = self.sys.cpus();
+        let cpu_model = if let Some(cpu) = cpus.first() {
+            cpu.brand().to_string()
+        } else {
+            "Unknown".to_string()
+        };
+        let cpu_cores = cpus.len() as u32;
+        let cpu_frequency = if let Some(cpu) = cpus.first() {
+            format!("{:.0} MHz", cpu.frequency())
+        } else {
+            "N/A".to_string()
+        };
+        
+        // 内存信息
+        let memory_total = self.sys.total_memory();
+        let memory_usable = self.sys.available_memory();
+        
+        // 磁盘信息
+        let disks = Disks::new_with_refreshed_list();
+        let disk_info: Vec<DiskInfo> = disks.iter().map(|disk| {
+            let total = disk.total_space();
+            let available = disk.available_space();
+            DiskInfo {
+                name: disk.name().to_string_lossy().to_string(),
+                mount: disk.mount_point().to_string_lossy().to_string(),
+                total,
+                available,
+                used: total.saturating_sub(available),
+            }
+        }).collect();
+        
+        // 监听端口 - 通过读取 /proc/net/tcp 和 /proc/net/udp
+        let ports = self.collect_listening_ports();
+        
+        // 操作系统版本和内核
+        let os_version = System::name().unwrap_or_else(|| "Unknown".to_string());
+        let kernel = System::kernel_version().unwrap_or_else(|| "Unknown".to_string());
+        
+        EnvironmentInfo {
+            cpu_model,
+            cpu_cores,
+            cpu_frequency,
+            memory_total,
+            memory_usable,
+            disk_info,
+            ports,
+            os_version,
+            kernel,
+        }
+    }
+    
+    /// 采集监听端口
+    fn collect_listening_ports(&self) -> Vec<PortInfo> {
+        let mut ports: Vec<PortInfo> = Vec::new();
+        
+        // 读取 TCP 监听端口
+        if let Ok(tcp_content) = std::fs::read_to_string("/proc/net/tcp") {
+            for line in tcp_content.lines().skip(1) {
+                if let Some(port_info) = self.parse_proc_net_line(line, "tcp") {
+                    ports.push(port_info);
+                }
+            }
+        }
+        
+        // 读取 UDP 监听端口
+        if let Ok(udp_content) = std::fs::read_to_string("/proc/net/udp") {
+            for line in udp_content.lines().skip(1) {
+                if let Some(port_info) = self.parse_proc_net_line(line, "udp") {
+                    ports.push(port_info);
+                }
+            }
+        }
+        
+        ports
+    }
+    
+    /// 解析 /proc/net/tcp 或 /proc/net/udp 行
+    fn parse_proc_net_line(&self, line: &str, protocol: &str) -> Option<PortInfo> {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 10 {
+            return None;
+        }
+        
+        // 本地地址格式: IP:PORT (hex)
+        let local_addr = parts[1];
+        let addr_parts: Vec<&str> = local_addr.split(':').collect();
+        if addr_parts.len() != 2 {
+            return None;
+        }
+        
+        // 端口 (hex to u16)
+        let port_hex = addr_parts[1];
+        let port = u16::from_str_radix(port_hex, 16).ok()?;
+        
+        // 跳过非监听状态 (状态 0A = LISTEN)
+        let state = u8::from_str_radix(parts[3], 16).unwrap_or(0);
+        if protocol == "tcp" && state != 0x0A {
+            return None;
+        }
+        
+        // inode -> PID 映射
+        let inode = parts[9].parse::<u64>().ok()?;
+        let program = self.find_process_by_inode(inode);
+        let pid = self.find_pid_by_inode(inode);
+        
+        Some(PortInfo {
+            protocol: protocol.to_uppercase(),
+            port,
+            program,
+            pid,
+        })
+    }
+    
+    /// 通过 inode 查找进程名
+    fn find_process_by_inode(&self, inode: u64) -> String {
+        // 遍历所有进程，查找对应的 socket inode
+        for (pid, process) in self.sys.processes() {
+            if let Ok(fd_dir) = std::fs::read_dir(format!("/proc/{}/fd", pid)) {
+                for entry in fd_dir.flatten() {
+                    if let Ok(link) = std::fs::read_link(entry.path()) {
+                        let link_str = link.to_string_lossy();
+                        if link_str.contains(&inode.to_string()) {
+                            return process.name().to_string_lossy().to_string();
+                        }
+                    }
+                }
+            }
+        }
+        "unknown".to_string()
+    }
+    
+    /// 通过 inode 查找 PID
+    fn find_pid_by_inode(&self, inode: u64) -> u32 {
+        for (pid, process) in self.sys.processes() {
+            if let Ok(fd_dir) = std::fs::read_dir(format!("/proc/{}/fd", pid)) {
+                for entry in fd_dir.flatten() {
+                    if let Ok(link) = std::fs::read_link(entry.path()) {
+                        let link_str = link.to_string_lossy();
+                        if link_str.contains(&inode.to_string()) {
+                            return pid.as_u32();
+                        }
+                    }
+                }
+            }
+        }
+        0
+    }
+}
+
 // ============================================================================
 // 工具函数
 // ============================================================================
@@ -291,12 +448,15 @@ pub fn format_rate(bytes_per_sec: u64) -> String {
 // Daemon 模式
 // ============================================================================
 
-fn run_daemon_mode() {
+fn run_daemon_mode(config_path: String) {
     println!("[xsec-agent] 启动 Daemon 模式...");
+    println!("[xsec-agent] 使用配置文件: {}", config_path);
     
     // 读取配置
-    let config_path = "/etc/xsec-agent/config.toml";
-    let config_content = std::fs::read_to_string(config_path).unwrap_or_default();
+    let config_content = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
+        eprintln!("[xsec-agent] 配置文件读取失败: {}", e);
+        std::process::exit(1);
+    });
     
     // 简单的配置解析
     let manager_host = extract_config_value(&config_content, "host").unwrap_or("127.0.0.1".to_string());
@@ -304,7 +464,11 @@ fn run_daemon_mode() {
         .unwrap_or("8443".to_string())
         .parse()
         .unwrap_or(8443);
-    let secret_key = extract_config_value(&config_content, "secret_key").unwrap_or("qaz@7410".to_string());
+
+    // 安全修复: 强制要求配置文件中设置密钥，不使用默认值
+    let secret_key = extract_config_value(&config_content, "secret_key")
+        .expect("[xsec-agent] 错误: 配置文件中未设置 secret_key，Agent 必须配置密钥才能启动");
+
     let agent_id = extract_config_value(&config_content, "id")
         .unwrap_or_else(|| hostname::get().map(|s| s.to_string_lossy().to_string()).unwrap_or_default());
     
@@ -327,7 +491,7 @@ fn run_daemon_mode() {
         println!("[xsec-agent] 尝试连接 Manager...");
         match client.connect() {
             Ok(_) => {
-                println!("[xsec-agent] 已连接到 Manager");
+                println!("[xsec-agent] 已连接到 Manager，准备发送注册消息...");
                 break;
             }
             Err(e) => {
@@ -337,13 +501,34 @@ fn run_daemon_mode() {
         }
     }
     
+    // 发送注册消息
+    println!("[xsec-agent] 发送注册消息...");
+    let hostname = hostname::get().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let register_msg = create_register_message_simple(
+        &client.get_config().agent_id,
+        &hostname,
+    );
+    if let Err(e) = client.send_message(&register_msg) {
+        eprintln!("[xsec-agent] 注册消息发送失败: {:?}, 5秒后重试...", e);
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        // 重连
+        loop {
+            match client.connect() {
+                Ok(_) => break,
+                Err(e) => {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                }
+            }
+        }
+    } else {
+        println!("[xsec-agent] 注册消息发送成功!");
+    }
+    
     // 主循环 - 发送心跳
+    let mut monitor = SystemMonitor::new();
     loop {
-        let mut monitor = SystemMonitor::new();
-        monitor.collect();
-        std::thread::sleep(std::time::Duration::from_secs(1));
         let metrics = monitor.collect();
-        
+
         let heartbeat_data = HeartbeatData {
             status: "online".to_string(),
             cpu_percent: metrics.cpu.usage_percent,
@@ -353,10 +538,11 @@ fn run_daemon_mode() {
             network_out: metrics.network.total_tx_bytes_per_sec,
             active_threats: 0,
             pending_commands: 0,
+            environment_info: Some(monitor.collect_environment()),
         };
-        
+
         let heartbeat = create_heartbeat_message(&agent_id, heartbeat_data);
-        
+
         if let Err(e) = client.send_message(&heartbeat) {
             println!("[xsec-agent] 发送心跳失败: {:?}, 重新连接...", e);
             loop {
@@ -372,19 +558,133 @@ fn run_daemon_mode() {
                 }
             }
         }
-        
+
         std::thread::sleep(std::time::Duration::from_secs(30));
     }
+}
+
+// ============================================================================
+// WSS Daemon 模式 (Async)
+// ============================================================================
+
+async fn run_daemon_mode_wss(config_path: String) {
+    println!("[xsec-agent] 启动 WSS Daemon 模式...");
+    println!("[xsec-agent] 使用配置文件: {}", config_path);
+
+    // 读取配置
+    let config_content = match std::fs::read_to_string(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[xsec-agent] 配置文件读取失败: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // 安全修复: 服务端地址硬编码，不允许配置修改
+    let server_url = "wss://center.xsec.dxp0rt.de5.net/ws";
+
+    let agent_id = extract_config_value(&config_content, "id")
+        .unwrap_or_else(|| hostname::get()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "unknown".to_string()));
+
+    // 安全修复: token 是必填的，不允许为空
+    let token = extract_config_value(&config_content, "token")
+        .expect("[xsec-agent] 错误: 配置文件中未设置 token，Agent 必须配置令牌才能启动");
+
+    if token.is_empty() {
+        eprintln!("[xsec-agent] 错误: token 不能为空");
+        std::process::exit(1);
+    }
+
+    let heartbeat_interval = extract_config_value(&config_content, "heartbeat_interval")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+
+    println!("[xsec-agent] 服务器: {}", server_url);
+    println!("[xsec-agent] Agent ID: {}", agent_id);
+
+    // 创建 WSS 配置
+    let ws_config = WsConfig {
+        server_url: server_url.to_string(),
+        agent_id: agent_id.clone(),
+        token,
+        heartbeat_interval_secs: heartbeat_interval,
+        reconnect_delay_secs: 5,
+        connection_timeout_secs: 10,
+    };
+
+    // 创建命令通道
+    let (command_tx, mut command_rx) = mpsc::channel::<CommandPayload>(100);
+
+    // 创建命令执行器
+    let command_executor = CommandExecutor::new();
+
+    // 创建 WSS 客户端
+    let client = Arc::new(WssClient::new(ws_config, command_tx));
+
+    // 克隆客户端用于命令处理
+    let client_for_commands = client.clone();
+    let client_for_spawn = client.clone();
+    let agent_id_for_commands = agent_id.clone();
+
+    // 启动命令处理任务
+    tokio::spawn(async move {
+        while let Some(cmd) = command_rx.recv().await {
+            println!("[WSS] 收到待执行命令: {} {:?}", cmd.command, cmd.args);
+
+            // 执行命令
+            let request = CommandRequest {
+                id: cmd.command_id.clone(),
+                command: cmd.command.clone(),
+                args: cmd.args.clone(),
+                timeout_secs: cmd.timeout_secs,
+                user: "root".to_string(),
+                work_dir: None,
+            };
+            let result = command_executor.execute(&request);
+
+            println!("[WSS] 命令执行完成: success={}", result.success);
+
+            // 发送命令结果 (通过 WSS 发送)
+            let result_payload = CommandResultPayload {
+                command_id: result.id.clone(),
+                success: result.success,
+                exit_code: result.exit_code,
+                stdout: result.stdout.clone(),
+                stderr: result.stderr.clone(),
+                duration_ms: result.duration_ms,
+            };
+
+            // 使用 WsMessage 格式发送命令结果
+            let result_msg = WsMessage {
+                msg_type: ws_client::WsMessageType::CommandResult,
+                agent_id: Some(agent_id_for_commands.clone()),
+                data: Some(serde_json::to_value(&result_payload).unwrap_or_default()),
+            };
+
+            if let Err(e) = client_for_spawn.send(&result_msg).await {
+                eprintln!("[WSS] 发送命令结果失败: {}", e);
+            }
+        }
+    });
+
+    // 启动 WSS 客户端
+    client_for_commands.run().await;
 }
 
 fn extract_config_value(content: &str, key: &str) -> Option<String> {
     for line in content.lines() {
         let line = line.trim();
-        if line.starts_with(&format!("{}=", key)) {
-            let value = line.split('=').nth(1)?.trim();
-            // 去掉引号
-            let value = value.trim_matches('"').trim_matches('\'');
-            return Some(value.to_string());
+        // 支持 "key = value" 或 "key=value" 格式
+        if let Some(eq_pos) = line.find('=') {
+            let line_key = line[..eq_pos].trim();
+            if line_key == key {
+                let value = line[eq_pos+1..].trim();
+                // 去掉引号
+                let value = value.trim_matches('"').trim_matches('\'');
+                return Some(value.to_string());
+            }
         }
     }
     None
@@ -394,12 +694,29 @@ fn extract_config_value(content: &str, key: &str) -> Option<String> {
 // 主程序入口
 // ============================================================================
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args: Vec<String> = std::env::args().collect();
-    
+
+    // 解析命令行参数
+    // 安全修复: 使用跨平台配置路径
+    let mut config_path = if cfg!(target_os = "windows") {
+        "C:\\ProgramData\\xsec-agent\\config.toml".to_string()
+    } else {
+        "/etc/xsec-agent/config.toml".to_string()
+    };
+
+    for (i, arg) in args.iter().enumerate() {
+        if *arg == "--config" || *arg == "-c" {
+            if i + 1 < args.len() {
+                config_path = args[i + 1].clone();
+            }
+        }
+    }
+
     // 检查 daemon 模式
     if args.contains(&"--daemon".to_string()) || args.contains(&"-d".to_string()) {
-        run_daemon_mode();
+        run_daemon_mode_wss(config_path).await;
         return;
     }
     
@@ -554,13 +871,13 @@ fn show_injection() {
 
 fn show_network_monitoring() {
     println!("\n========== 进程网络监控 ==========");
-    let monitor = NetworkMonitor::new();
+    let mut monitor = NetworkMonitor::new();
     let sys = sysinfo::System::new_all();
-    
+
     // 显示网络信息
     let network_info = monitor.get_process_network_info(&sys);
     println!("{}", format_network_info(&network_info, Some(20)));
-    
+
     // 显示网络异常
     let alerts = monitor.detect_anomalies(&sys);
     println!("{}", format_network_alerts(&alerts));

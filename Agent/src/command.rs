@@ -86,22 +86,43 @@ impl CommandWhitelist {
     pub fn is_allowed(&self, command: &str, args: &[String]) -> (bool, String) {
         // 检查命令是否在白名单
         if let Some(allowed_args) = self.allowed_commands.get(command) {
-            // 检查参数是否匹配
-            for pattern in allowed_args {
-                if pattern == "*" || pattern == ".*" {
+            // 安全修复: 精确参数匹配，不再允许通配符
+            // 如果没有定义任何参数模式，只允许无参数执行
+            if allowed_args.is_empty() {
+                if args.is_empty() {
                     return (true, "allowed".to_string());
-                }
-                // 简单前缀匹配
-                if args.iter().any(|a| a.starts_with(&pattern.replace("*", ""))) {
-                    return (true, "allowed".to_string());
+                } else {
+                    return (false, format!("command '{}' does not allow arguments", command));
                 }
             }
-            // 如果没有匹配任何模式但命令在白名单中，允许执行
-            if args.is_empty() || args.iter().all(|a| a == "-*" || a.starts_with("-")) {
+
+            // 检查参数是否匹配
+            for pattern in allowed_args {
+                // 完全禁止通配符模式
+                if pattern == "*" || pattern == ".*" {
+                    // 不再允许通配符匹配所有参数
+                    return (false, format!("wildcard patterns are not allowed for command '{}'", command));
+                }
+                // 前缀匹配（去除危险的前缀模式）
+                let prefix = pattern.replace("*", "");
+                // 禁止 -rf, -r, -f 等危险参数组合
+                let dangerous_patterns = ["-rf", "-r ", "-f ", "-fr"];
+                for arg in args {
+                    if dangerous_patterns.iter().any(|dp| arg == dp || arg.starts_with(&format!("{} ", dp))) {
+                        return (false, format!("dangerous argument '{}' is not allowed", arg));
+                    }
+                    if arg.starts_with(&prefix) && !prefix.is_empty() {
+                        return (true, "allowed".to_string());
+                    }
+                }
+            }
+
+            // 如果没有匹配任何模式且命令在白名单中，只允许纯选项参数
+            if args.is_empty() || args.iter().all(|a| a.starts_with("-") && !a.contains("/") && !a.contains(".")) {
                 return (true, "allowed".to_string());
             }
         }
-        
+
         (false, format!("command '{}' not in whitelist", command))
     }
 }

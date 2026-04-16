@@ -1,340 +1,517 @@
-//! Agent WebSocket 客户端模块
-//! 用于从 Manager 接收实时告警推送
-//! 协议: 继承 HTTP 基础认证, 通过 WebSocket 升级通道接收告警
+//! WebSocket 客户端模块
+//! 通过 WSS (WebSocket over HTTPS) 与 Manager 通信
+//! 支持：数据上报、心跳、命令下发、文件传输
 //!
-//! 使用方式:
-//!   1. 与 Manager 建立 HTTP 连接获取认证 token
-//!   2. 升级到 WebSocket 连接
-//!   3. 接收 Manager 推送的告警事件
+//! 注意: 本客户端配置为接受自签名证书，仅用于开发/测试环境
+//! 生产环境应使用 Let's Encrypt 证书
 
+use futures_util::{SinkExt, StreamExt};
+use native_tls::TlsConnector as NativeTlsConnector;
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use std::net::TcpStream;
-use std::io::{Read, Write};
-use rand::Rng;
+use sysinfo::System;
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+use tokio_native_tls::TlsConnector;
+use tokio_tungstenite::{client_async, tungstenite::Message as WsRawMessage};
+use url::Url;
 
-use crate::alert::{AlertManager, AlertLevel, AlertCategory};
+use crate::protocol::{
+    AgentInfo, CommandPayload, HeartbeatData, ManagerIncoming,
+    MessagePayload, ThreatReportPayload,
+};
 
-// ============================================================================
-// WebSocket 帧处理 (RFC 6455)
-// ============================================================================
-
-/// WebSocket opcode
-#[derive(Debug, Clone, Copy)]
-pub enum OpCode {
-    Continuation = 0x0,
-    Text = 0x1,
-    Binary = 0x2,
-    Close = 0x8,
-    Ping = 0x9,
-    Pong = 0xA,
-}
-
-/// WebSocket 帧
-#[derive(Debug)]
-pub struct WsFrame {
-    pub opcode: OpCode,
-    pub payload: Vec<u8>,
-}
-
-impl WsFrame {
-    /// 解析 WebSocket 帧
-    pub fn parse(stream: &mut impl Read) -> std::io::Result<Option<Self>> {
-        let mut header = [0u8; 2];
-        if stream.read_exact(&mut header).is_err() {
-            return Ok(None); // 连接关闭
-        }
-
-        let opcode_byte = header[0] & 0x0F;
-        let opcode = match opcode_byte {
-            0x1 => OpCode::Text,
-            0x2 => OpCode::Binary,
-            0x8 => OpCode::Close,
-            0x9 => OpCode::Ping,
-            0xA => OpCode::Pong,
-            _ => return Ok(None),
-        };
-
-        let masked = (header[1] & 0x80) != 0;
-        let mut payload_len = (header[1] & 0x7F) as usize;
-
-        // 扩展长度 (126 = 16bit, 127 = 64bit)
-        if payload_len == 126 {
-            let mut ext = [0u8; 2];
-            stream.read_exact(&mut ext)?;
-            payload_len = usize::from(u16::from_be_bytes(ext));
-        } else if payload_len == 127 {
-            let mut ext = [0u8; 8];
-            stream.read_exact(&mut ext)?;
-            payload_len = usize::try_from(u64::from_be_bytes(ext))
-                .unwrap_or(usize::MAX);
-        }
-
-        // 读取 masking key (如果客户端帧)
-        let mut mask_key = [0u8; 4];
-        if masked {
-            stream.read_exact(&mut mask_key)?;
-        }
-
-        // 读取 payload
-        let mut payload = vec![0u8; payload_len];
-        stream.read_exact(&mut payload)?;
-
-        // 解掩码
-        if masked {
-            for (i, byte) in payload.iter_mut().enumerate() {
-                *byte ^= mask_key[i % 4];
-            }
-        }
-
-        Ok(Some(WsFrame { opcode, payload }))
-    }
-
-    /// 构建 WebSocket 文本帧
-    pub fn text_frame(data: &str) -> Vec<u8> {
-        Self::build_frame(OpCode::Text, data.as_bytes())
-    }
-
-    /// 构建 WebSocket 关闭帧
-    pub fn close_frame() -> Vec<u8> {
-        Self::build_frame(OpCode::Close, &[])
-    }
-
-    /// Ping 帧
-    pub fn ping_frame() -> Vec<u8> {
-        Self::build_frame(OpCode::Ping, &[])
-    }
-
-    fn build_frame(opcode: OpCode, payload: &[u8]) -> Vec<u8> {
-        let payload_len = payload.len();
-        let mut frame = Vec::with_capacity(2 + payload_len + if payload_len > 65535 { 10 } else if payload_len > 125 { 4 } else { 0 });
-
-        // FIN + opcode
-        frame.push(0x80 | (opcode as u8)); // FIN = 1
-        // Payload length (服务端发送，不掩码)
-        if payload_len > 65535 {
-            frame.push(0x7F);
-            frame.extend_from_slice(&(payload_len as u64).to_be_bytes());
-        } else if payload_len > 125 {
-            frame.push(0x7E);
-            frame.extend_from_slice(&(payload_len as u16).to_be_bytes());
-        } else {
-            frame.push(payload_len as u8);
-        }
-        frame.extend_from_slice(payload);
-        frame
-    }
-}
-
-// ============================================================================
-// WebSocket 握手 (HTTP Upgrade)
-// ============================================================================
-
-fn ws_handshake(host: &str, port: u16, path: &str) -> std::io::Result<TcpStream> {
-    let mut socket = TcpStream::connect(format!("{}:{}", host, port))?;
-    socket.set_read_timeout(Some(Duration::from_secs(10)))?;
-    socket.set_write_timeout(Some(Duration::from_secs(10)))?;
-
-    let key = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        rand_key()
-    );
-
-    let request = format!(
-        "GET {} HTTP/1.1\r\n\
-         Host: {}:{}\r\n\
-         Upgrade: websocket\r\n\
-         Connection: Upgrade\r\n\
-         Sec-WebSocket-Key: {}\r\n\
-         Sec-WebSocket-Version: 13\r\n\
-         \r\n",
-        path, host, port, key
-    );
-
-    socket.write_all(request.as_bytes())?;
-
-    // 读取握手响应
-    let mut response = vec![0u8; 1024];
-    let n = socket.read(&mut response)?;
-    let resp_str = String::from_utf8_lossy(&response[..n]);
-
-    if !resp_str.contains("101 Switching Protocols") && !resp_str.contains("101") {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("WebSocket handshake failed: {}", resp_str.lines().next().unwrap_or("unknown")))
-        );
-    }
-
-    Ok(socket)
-}
-
-// FIX 9: Use rand::random for cryptographic randomness
-fn rand_key() -> [u8; 16] {
-    rand::random()
-}
-
-// ============================================================================
-// 告警接收器
-// ============================================================================
-
-/// 从 Manager WebSocket 推送的告警消息
-#[derive(Debug, serde::Deserialize)]
-pub struct WsAlertMessage {
-    pub alert_id: i64,
+/// WSS 客户端配置
+#[derive(Debug, Clone)]
+pub struct WsConfig {
+    /// 服务端地址 (硬编码)
+    pub server_url: String,
+    /// Agent ID
     pub agent_id: String,
-    pub alert_type: String,
-    pub severity: String,
-    pub title: String,
-    pub description: String,
-    pub source_ip: String,
-    pub created_at: String,
+    /// 连接令牌 (必填)
+    pub token: String,
+    /// 心跳间隔 (秒)
+    pub heartbeat_interval_secs: u64,
+    /// 重连延迟 (秒)
+    pub reconnect_delay_secs: u64,
+    /// 连接超时 (秒)
+    pub connection_timeout_secs: u64,
 }
 
-/// WebSocket 告警接收器
-/// 管理与 Manager 的 WebSocket 连接，接收并处理实时告警推送
-pub struct WsAlertReceiver {
-    host: String,
-    port: u16,
-    path: String,
-    agent_id: String,
-    alert_manager: Arc<Mutex<AlertManager>>,
-    running: Arc<Mutex<bool>>,
-    last_ping: Arc<Mutex<u64>>,
-}
-
-impl WsAlertReceiver {
-    pub fn new(host: String, port: u16, agent_id: String, alert_manager: Arc<Mutex<AlertManager>>) -> Self {
+impl Default for WsConfig {
+    fn default() -> Self {
         Self {
-            host,
-            port,
-            path: "/ws/alerts".to_string(),
-            agent_id,
-            alert_manager,
-            running: Arc::new(Mutex::new(false)),
-            last_ping: Arc::new(Mutex::new(0)),
+            // 安全修复: 服务端地址硬编码，不允许配置修改
+            server_url: "wss://center.xsec.dxp0rt.de5.net/ws".to_string(),
+            agent_id: hostname::get()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "unknown".to_string()),
+            token: String::new(),
+            heartbeat_interval_secs: 30,
+            reconnect_delay_secs: 5,
+            connection_timeout_secs: 10,
+        }
+    }
+}
+
+/// 连接状态
+#[derive(Debug, Clone, PartialEq)]
+pub enum WsConnectionState {
+    Disconnected,
+    Connecting,
+    Connected,
+    Authenticated,
+    Error(String),
+}
+
+/// WebSocket 消息类型
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WsMessageType {
+    // Agent -> Server
+    #[serde(rename = "agent_register")]
+    AgentRegister,
+    #[serde(rename = "heartbeat")]
+    Heartbeat,
+    #[serde(rename = "threat_report")]
+    ThreatReport,
+    #[serde(rename = "command_result")]
+    CommandResult,
+    #[serde(rename = "file_chunk")]
+    FileChunk,
+    #[serde(rename = "pong")]
+    Pong,
+
+    // Server -> Agent
+    #[serde(rename = "command_execute")]
+    CommandExecute,
+    #[serde(rename = "response_policy")]
+    ResponsePolicy,
+    #[serde(rename = "config_update")]
+    ConfigUpdate,
+    #[serde(rename = "agent_control")]
+    AgentControl,
+    #[serde(rename = "file_transfer")]
+    FileTransfer,
+    #[serde(rename = "ping")]
+    Ping,
+}
+
+/// WebSocket 消息结构
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WsMessage {
+    #[serde(rename = "type")]
+    pub msg_type: WsMessageType,
+    pub agent_id: Option<String>,
+    pub data: Option<serde_json::Value>,
+}
+
+/// 文件分片传输
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileChunk {
+    pub chunk_id: u64,
+    pub total_chunks: u64,
+    pub filename: String,
+    pub data: String,  // Base64 编码
+    pub checksum: u32,
+    pub action: String,  // "upload" or "download"
+}
+
+/// 文件传输元数据
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileTransferMeta {
+    pub filename: String,
+    pub total_size: u64,
+    pub total_chunks: u64,
+    pub checksum: u32,
+    pub action: String,
+}
+
+/// WSS 客户端
+pub struct WssClient {
+    config: WsConfig,
+    state: Arc<Mutex<WsConnectionState>>,
+    command_tx: mpsc::Sender<CommandPayload>,
+    // 用于发送消息的 channel
+    write_tx: Arc<Mutex<Option<mpsc::Sender<String>>>>,
+    // 系统监控器 (使用 Arc<Mutex> 以兼容 async)
+    sys: Arc<Mutex<System>>,
+}
+
+/// 命令结果回调类型
+pub type CommandCallback = Box<dyn Fn(CommandPayload) + Send + Sync>;
+
+impl WssClient {
+    /// 创建新的 WSS 客户端
+    pub fn new(config: WsConfig, command_tx: mpsc::Sender<CommandPayload>) -> Self {
+        Self {
+            config,
+            state: Arc::new(Mutex::new(WsConnectionState::Disconnected)),
+            command_tx,
+            write_tx: Arc::new(Mutex::new(None)),
+            sys: Arc::new(Mutex::new(System::new_all())),
         }
     }
 
-    /// 启动接收循环 (blocking) with exponential backoff
-    pub fn run(&self) {
-        let mut retry_delay_secs: u64 = 1;
-        let max_delay_secs: u64 = 60;
-        
+    /// 启动客户端主循环
+    pub async fn run(&self) {
+        let mut reconnect_delay = self.config.reconnect_delay_secs;
+
         loop {
-            match self.connect_and_receive() {
-                Ok(()) => {
-                    retry_delay_secs = 1;  // Reset on successful connection
+            self.set_state(WsConnectionState::Connecting);
+
+            match self.connect_and_handle().await {
+                Ok(_) => {
+                    println!("[WSS] 连接正常关闭");
+                    reconnect_delay = self.config.reconnect_delay_secs; // 重置延迟
                 }
                 Err(e) => {
-                    eprintln!("[WS] Connection error: {}, retrying in {}s (exponential backoff, max {}s)...",
-                             e, retry_delay_secs, max_delay_secs);
-                    std::thread::sleep(Duration::from_secs(retry_delay_secs));
-                    // Exponential backoff: 1, 2, 4, 8, 16, 32, 60, 60, ...
-                    retry_delay_secs = (retry_delay_secs * 2).min(max_delay_secs);
+                    eprintln!("[WSS] 连接错误: {}, {:.1}s 后重连...",
+                        e, reconnect_delay as f64);
                 }
             }
+
+            // 指数退避重连，最大 5 分钟
+            tokio::time::sleep(Duration::from_secs(reconnect_delay)).await;
+            reconnect_delay = (reconnect_delay * 2).min(300);
         }
     }
 
-    fn connect_and_receive(&self) -> std::io::Result<()> {
-        let mut stream = ws_handshake(&self.host, self.port, &self.path)?;
-        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    /// 创建接受自签名证书的 TLS 连接器 (tokio-native-tls)
+    fn create_insecure_tls_connector(&self) -> Result<TlsConnector, String> {
+        let inner = NativeTlsConnector::builder()
+            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_hostnames(true)
+            .build()
+            .map_err(|e| format!("TLS 连接器创建失败: {}", e))?;
+        Ok(TlsConnector::from(inner))
+    }
 
-        *self.running.lock().unwrap() = true;
-        eprintln!("[WS] Connected to Manager at {}:{}", self.host, self.port);
+    /// 连接并处理消息
+    async fn connect_and_handle(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let url = Url::parse(&self.config.server_url)
+            .map_err(|e| format!("无效的服务器 URL: {}", e))?;
 
-        // 发送订阅消息
-        let subscribe = serde_json::json!({
-            "type": "subscribe",
-            "channels": ["alerts"]
-        });
-        let msg = WsFrame::text_frame(&subscribe.to_string());
-        stream.write_all(&msg)?;
-        stream.flush()?;
+        let domain = url.domain().unwrap_or("localhost");
+        let port = url.port().unwrap_or(443);
+        let addr = format!("{}:{}", domain, port);
 
+        println!("[WSS] 连接到 {} (domain: {})", self.config.server_url, domain);
+
+        // 创建接受自签名证书的 TLS 连接器
+        let tls_connector = self.create_insecure_tls_connector()?;
+
+        // TCP 连接
+        let tcp_stream = TcpStream::connect(&addr)
+            .await
+            .map_err(|e| format!("TCP 连接失败 ({}): {}", addr, e))?;
+
+        // TLS 升级
+        let tls_stream = tls_connector.connect(domain, tcp_stream)
+            .await
+            .map_err(|e| format!("TLS 连接失败: {}", e))?;
+
+        // WebSocket 握手 (client_async 自动处理握手，直接传 URL)
+        let (ws_stream, _) = tokio::time::timeout(
+            Duration::from_secs(self.config.connection_timeout_secs),
+            client_async(url.as_str(), tls_stream),
+        )
+        .await
+        .map_err(|_| "连接超时")?
+        .map_err(|e| format!("WebSocket 连接失败: {}", e))?;
+
+        println!("[WSS] 已连接，正在进行 WebSocket 握手...");
+
+        let (mut write, mut read) = ws_stream.split();
+
+        // 发送注册消息
+        let register_msg = self.create_register_message();
+        let json = serde_json::to_string(&register_msg)
+            .map_err(|e| format!("JSON 序列化失败: {}", e))?;
+        write.send(WsRawMessage::Text(json.into())).await
+            .map_err(|e| format!("发送注册消息失败: {}", e))?;
+
+        self.set_state(WsConnectionState::Authenticated);
+        println!("[WSS] 已认证，开始处理消息...");
+
+        // 创建消息发送 channel
+        let (msg_tx, mut msg_rx) = mpsc::channel::<String>(100);
+        {
+            let mut write_lock = self.write_tx.lock().unwrap();
+            *write_lock = Some(msg_tx);
+        }
+
+        // 消息处理循环
         loop {
-            match WsFrame::parse(&mut stream) {
-                Ok(Some(frame)) => {
-                    match frame.opcode {
-                        OpCode::Text | OpCode::Binary => {
-                            if let Ok(text) = String::from_utf8(frame.payload.clone()) {
-                                self.handle_message(&text);
+            tokio::select! {
+                // 接收消息
+                msg = read.next() => {
+                    match msg {
+                        Some(Ok(WsRawMessage::Text(text))) => {
+                            if let Err(e) = self.handle_message(&text.to_string()).await {
+                                eprintln!("[WSS] 消息处理错误: {}", e);
                             }
                         }
-                        OpCode::Ping => {
-                            // 响应 Pong
-                            let pong = WsFrame::build_frame(OpCode::Pong, &[]);
-                            stream.write_all(&pong)?;
-                            stream.flush()?;
+                        Some(Ok(WsRawMessage::Ping(data))) => {
+                            // 自动响应 Pong
+                            write.send(WsRawMessage::Pong(data)).await.ok();
                         }
-                        OpCode::Pong => {
-                            *self.last_ping.lock().unwrap() = crate::protocol::now_timestamp();
-                        }
-                        OpCode::Close => {
-                            eprintln!("[WS] Server closed connection");
+                        Some(Ok(WsRawMessage::Close(_))) => {
+                            println!("[WSS] 服务端关闭连接");
                             break;
                         }
-                        _ => { }
+                        Some(Ok(WsRawMessage::Binary(data))) => {
+                            // 处理二进制消息（如文件分片）
+                            if let Err(e) = self.handle_binary(&data).await {
+                                eprintln!("[WSS] 二进制消息处理错误: {}", e);
+                            }
+                        }
+                        Some(Err(e)) => {
+                            eprintln!("[WSS] 接收错误: {}", e);
+                            break;
+                        }
+                        None => {
+                            println!("[WSS] 连接已关闭");
+                            break;
+                        }
+                        _ => {}
                     }
                 }
-                Ok(None) => {
-                    eprintln!("[WS] Connection closed");
-                    break;
+                // 处理待发送的消息
+                Some(json) = msg_rx.recv() => {
+                    if write.send(WsRawMessage::Text(json.into())).await.is_err() {
+                        println!("[WSS] 消息发送失败，连接可能已断开");
+                        break;
+                    }
                 }
-                Err(e) => {
-                    eprintln!("[WS] Read error: {}", e);
-                    break;
+                // 心跳 (每 30 秒)
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                    let heartbeat = self.create_heartbeat_message();
+                    if let Ok(json) = serde_json::to_string(&heartbeat) {
+                        if write.send(WsRawMessage::Text(json.into())).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         }
 
-        *self.running.lock().unwrap() = false;
+        // 清除 write_tx
+        {
+            let mut write_lock = self.write_tx.lock().unwrap();
+            *write_lock = None;
+        }
+
+        self.set_state(WsConnectionState::Disconnected);
         Ok(())
     }
 
-    fn handle_message(&self, text: &str) {
-        // 解析告警消息
-        if let Ok(alert_msg) = serde_json::from_str::<WsAlertMessage>(text) {
-            let level = match alert_msg.severity.to_lowercase().as_str() {
-                "critical" => AlertLevel::Critical,
-                "high" => AlertLevel::High,
-                "medium" => AlertLevel::Medium,
-                "low" => AlertLevel::Low,
-                _ => AlertLevel::Info,
-            };
+    /// 处理接收到的消息
+    async fn handle_message(&self, text: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let msg: WsMessage = serde_json::from_str(text)
+            .map_err(|e| format!("JSON 解析失败: {}", e))?;
 
-            let category = match alert_msg.alert_type.as_str() {
-                "security" => AlertCategory::Security,
-                "network" => AlertCategory::Network,
-                "process" => AlertCategory::Process,
-                "service" => AlertCategory::Service,
-                _ => AlertCategory::Custom,
-            };
-
-            // 通过 AlertManager 发送本地告警
-            let am = self.alert_manager.lock().unwrap();
-            am.send_alert(
-                level,
-                category,
-                &alert_msg.title,
-                &alert_msg.description,
-                &format!("ws://{}", alert_msg.agent_id),
-            );
-
-            eprintln!(
-                "[WS Alert] {} | {} - {} ({})",
-                alert_msg.severity,
-                alert_msg.title,
-                alert_msg.description,
-                alert_msg.source_ip
-            );
+        match msg.msg_type {
+            WsMessageType::Ping => {
+                // 收到 Ping，回复 Pong
+                println!("[WSS] 收到 Ping");
+            }
+            WsMessageType::CommandExecute => {
+                // 收到命令，执行并返回结果
+                if let Some(data) = msg.data {
+                    if let Ok(cmd) = serde_json::from_value::<CommandPayload>(data) {
+                        println!("[WSS] 收到命令: {} {:?}", cmd.command, cmd.args);
+                        // 发送命令到处理队列
+                        self.command_tx.send(cmd).await.ok();
+                    }
+                }
+            }
+            WsMessageType::ResponsePolicy => {
+                println!("[WSS] 收到响应策略更新");
+            }
+            WsMessageType::ConfigUpdate => {
+                println!("[WSS] 收到配置更新");
+            }
+            WsMessageType::AgentControl => {
+                println!("[WSS] 收到控制指令");
+            }
+            WsMessageType::FileTransfer => {
+                println!("[WSS] 收到文件传输请求");
+            }
+            _ => {
+                println!("[WSS] 收到未知类型消息: {:?}", msg.msg_type);
+            }
         }
+
+        Ok(())
+    }
+
+    /// 处理二进制消息
+    async fn handle_binary(&self, data: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // 二进制消息格式: [4字节类型][4字节长度][JSON元数据][二进制数据]
+        if data.len() < 8 {
+            return Ok(());
+        }
+
+        let msg_type = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        let json_len = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
+
+        if data.len() < 8 + json_len {
+            return Ok(());
+        }
+
+        let json_data = &data[8..8 + json_len];
+        let binary_data = &data[8 + json_len..];
+
+        match msg_type {
+            0x01 => {
+                // 文件分片
+                let chunk: FileChunk = serde_json::from_slice(json_data)?;
+                println!("[WSS] 收到文件分片: {}/{}", chunk.chunk_id, chunk.total_chunks);
+                // 处理文件写入
+            }
+            _ => {
+                println!("[WSS] 收到未知二进制消息类型: {}", msg_type);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 创建注册消息
+    fn create_register_message(&self) -> WsMessage {
+        let info = AgentInfo {
+            hostname: hostname::get()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "unknown".to_string()),
+            ip: local_ip_address::local_ip()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| "127.0.0.1".to_string()),
+            mac: crate::protocol::get_mac_address(),
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            capabilities: vec![
+                "process".to_string(),
+                "network".to_string(),
+                "service".to_string(),
+                "injection".to_string(),
+                "hidden".to_string(),
+                "startup".to_string(),
+                "lineage".to_string(),
+                "memfeature".to_string(),
+                "realtime".to_string(),
+                "response".to_string(),
+                "command".to_string(),
+            ],
+        };
+
+        // 构建包含 token 的注册数据
+        let register_data = serde_json::json!({
+            "info": info,
+            "token": self.config.token,
+        });
+
+        WsMessage {
+            msg_type: WsMessageType::AgentRegister,
+            agent_id: Some(self.config.agent_id.clone()),
+            data: Some(register_data),
+        }
+    }
+
+    /// 创建心跳消息 (使用真实系统指标)
+    fn create_heartbeat_message(&self) -> WsMessage {
+        let mut sys = self.sys.lock().unwrap();
+        // 刷新系统信息
+        sys.refresh_cpu_usage();
+        sys.refresh_memory();
+
+        let cpu_percent = sys.global_cpu_usage();
+        let memory_percent = if sys.total_memory() > 0 {
+            (sys.used_memory() as f32 / sys.total_memory() as f32) * 100.0
+        } else {
+            0.0
+        };
+
+        let heartbeat = HeartbeatData {
+            status: "online".to_string(),
+            cpu_percent,
+            memory_percent,
+            disk_percent: 0.0,  // 磁盘信息需要额外处理
+            network_in: 0,
+            network_out: 0,
+            active_threats: 0,
+            pending_commands: 0,
+            environment_info: None,
+        };
+
+        WsMessage {
+            msg_type: WsMessageType::Heartbeat,
+            agent_id: Some(self.config.agent_id.clone()),
+            data: Some(serde_json::to_value(heartbeat).unwrap_or_default()),
+        }
+    }
+
+    /// 发送消息
+    pub async fn send(&self, msg: &WsMessage) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let json = serde_json::to_string(msg)
+            .map_err(|e| format!("JSON 序列化失败: {}", e))?;
+
+        // 在锁外执行异步操作，避免 MutexGuard 跨越 await
+        let tx = {
+            let write_lock = self.write_tx.lock().unwrap();
+            write_lock.clone()
+        };
+
+        if let Some(tx) = tx {
+            tx.send(json).await
+                .map_err(|e| format!("发送消息失败: {}", e))?;
+            Ok(())
+        } else {
+            Err("WebSocket 未连接".into())
+        }
+    }
+
+    fn set_state(&self, state: WsConnectionState) {
+        *self.state.lock().unwrap() = state;
+    }
+
+    /// 获取当前状态
+    pub fn get_state(&self) -> WsConnectionState {
+        self.state.lock().unwrap().clone()
     }
 }
 
-// 实现 Debug 以满足 Arc
-impl std::fmt::Debug for WsAlertReceiver {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "WsAlertReceiver {{ host: {}:{}, path: {} }}", self.host, self.port, self.path)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ws_message_serialization() {
+        let msg = WsMessage {
+            msg_type: WsMessageType::Heartbeat,
+            agent_id: Some("test-agent".to_string()),
+            data: None,
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"heartbeat\""));
+        assert!(json.contains("\"agent_id\":\"test-agent\""));
+    }
+
+    #[test]
+    fn test_file_chunk_serialization() {
+        let chunk = FileChunk {
+            chunk_id: 1,
+            total_chunks: 10,
+            filename: "test.exe".to_string(),
+            data: "base64data".to_string(),
+            checksum: 12345,
+            action: "download".to_string(),
+        };
+
+        let json = serde_json::to_string(&chunk).unwrap();
+        assert!(json.contains("\"chunk_id\":1"));
+        assert!(json.contains("\"filename\":\"test.exe\""));
     }
 }
