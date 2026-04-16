@@ -31,6 +31,10 @@ hmac-sha256 = "1"
 hex = "0.4"
 constant_time_eq = "0.3"
 rand = "0.8"
+url = "2"
+tokio-tungstenite = { version = "0.21", features = ["tokio-native-tls"] }
+native-tls = "0.2"
+tokio-native-tls = "0.3"
 once_cell = "1.19"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
@@ -42,7 +46,3 @@ tracing-appender = "0.2"
 [features]
 default = ["network"]
 network = ["reqwest"]
-url = "2"
-tokio-tungstenite = { version = "0.21", features = ["tokio-native-tls"] }
-native-tls = "0.2"
-tokio-native-tls = "0.3"
