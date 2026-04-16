@@ -119,6 +119,7 @@ impl Client {
                 .unwrap_or_else(|_| "127.0.0.1".to_string()),
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
+            mac: crate::protocol::get_mac_address(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             capabilities: vec![
                 "process".to_string(),
@@ -292,6 +293,11 @@ impl Client {
     /// 获取连接状态
     pub fn get_state(&self) -> ConnectionState {
         self.state.lock().unwrap().clone()
+    }
+
+    /// 获取配置
+    pub fn get_config(&self) -> &ManagerConfig {
+        &self.config
     }
 
     fn set_state(&self, state: ConnectionState) {
